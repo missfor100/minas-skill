@@ -1,0 +1,9 @@
+﻿# secrets / local
+.env
+*.pem
+*.key
+minas.local.*
+config.local.json
+__pycache__/
+*.pyc
+.DS_Store
