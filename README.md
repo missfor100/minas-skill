@@ -37,10 +37,30 @@
 ```powershell
 $env:MINAS_HOST = "<NAS 的 IP 或主机名>"
 $env:MINAS_SHARE = "<共享名>"
+
+# 限制所有文件操作只允许该 UNC 前缀（不设置则允许任意 UNC，
+# 但一律拒绝本地路径如 C:\...，且拒绝用 ../ 逃逸出该前缀）
+$env:MINAS_ROOT = "\\192.168.x.x\共享名"
+
 # 若 Windows 没有现成会话再设置：
 $env:MINAS_USER = "<SMB 用户名>"
-$env:MINAS_PASS = "<SMB 密码>"
 ```
+
+**密码三选一（按优先级）**：
+
+1. **交互提示（推荐）**：在可交互终端运行时，`net use` 会以 `*` 方式提示输入，
+   密码不进命令行、不进环境变量；
+2. **密码文件（非交互/agent 场景）**：
+
+   ```powershell
+   Set-Content -Path .\minas_pw.txt -Value "<SMB 密码>" -NoNewline
+   # 收紧权限：仅当前用户可读
+   icacls .\minas_pw.txt /inheritance:r /grant:r "$env:USERNAME`:F"
+   $env:MINAS_PASSWORD_FILE = ".\minas_pw.txt"
+   ```
+
+3. **环境变量（最后兼容，不推荐）**：`$env:MINAS_PASS = "<SMB 密码>"` —— 脚本会打印
+   安全警告（环境变量可能被子进程/转储读到）。
 
 也可以只用当前 Windows 已认证的 SMB 会话（资源管理器能打开共享即可）。
 
@@ -189,9 +209,12 @@ net use * /delete /y
 ## 8. 安全须知
 
 1. 只在自有/授权设备上使用  
-2. 不要把 `MINAS_PASS`、完整账号写进 Git、笔记或聊天记录  
+2. 密码优先用交互提示或 `MINAS_PASSWORD_FILE`；不要把 `MINAS_PASS`、完整账号写进 Git、笔记或聊天记录  
 3. 公开分享仓库前确认 `.gitignore` 已排除 `*.pem` / `.env` / 密码文件  
 4. 对不可恢复的删除操作保持谨慎  
+5. **路径根约束**：所有远端路径必须是 UNC（`\\主机\共享\...`），本地路径（`C:\...`）
+   一律拒绝；设置 `MINAS_ROOT` 后，路径规范化（去掉 `../`）仍必须落在该前缀之下，
+   `rm --recursive` 等删除操作同样受此约束  
 
 ---
 

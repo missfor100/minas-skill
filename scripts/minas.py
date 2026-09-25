@@ -8,8 +8,12 @@ Environment:
   MINAS_HOST     NAS hostname or IP (e.g. 192.168.1.50 or minas.local)
   MINAS_SHARE    Share name to use as default root (optional)
   MINAS_USER     SMB username (optional if Windows already has a session)
-  MINAS_PASS     SMB password (optional if Windows already has a session)
-  MINAS_ROOT     Logical root inside share (default "/")
+  MINAS_PASSWORD_FILE  File holding the SMB password (preferred non-interactive way)
+  MINAS_PASS     SMB password env fallback (last resort; a security warning is printed;
+                 prefer MINAS_PASSWORD_FILE or the interactive prompt)
+  MINAS_ROOT     Restrict every remote file op to this UNC prefix. Unset = any UNC path.
+                 Remote paths must ALWAYS be UNC (\\\\host\\share\\...); local paths
+                 (C:\\...) and "../" escapes outside MINAS_ROOT are rejected.
 
 Examples:
   python minas.py shares
@@ -65,6 +69,47 @@ def parse_unc(path: str) -> tuple[str, str, str]:
     return host, share, inner
 
 
+def collapse_unc(path: str) -> str:
+    """Lexically drop '.'/'..' segments in a normalized UNC path.
+
+    '..' may not climb above \\host\\share (raises ValueError instead).
+    """
+    p = norm_unc(path)
+    if not p.startswith("\\\\"):
+        return p
+    parts = p[2:].split("\\")
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        raise ValueError(f"UNC needs host and share: {path}")
+    keep = parts[:2]
+    for seg in parts[2:]:
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if len(keep) <= 2:
+                raise ValueError(f"path escapes share root: {path}")
+            keep.pop()
+            continue
+        keep.append(seg)
+    return "\\\\" + "\\".join(keep)
+
+
+def safe_remote(path: str) -> str:
+    """校验并规范化远端路径：必须是 UNC，且（若设置 MINAS_ROOT）落在其前缀之下。
+
+    先做词法折叠去掉 ../，再比对前缀，防止用 .. 绕过 MINAS_ROOT。
+    非 UNC 路径（如 C:\\...）一律拒绝。MINAS_ROOT 未设置时允许任意 UNC。
+    """
+    p = collapse_unc(path)
+    if not p.startswith("\\\\"):
+        raise ValueError(f"remote path must be UNC (\\\\host\\share\\...), got: {path}")
+    root = os.environ.get("MINAS_ROOT", "").strip()
+    if root:
+        r = collapse_unc(root)
+        if p.lower() != r.lower() and not p.lower().startswith(r.lower().rstrip("\\") + "\\"):
+            raise ValueError(f"path outside MINAS_ROOT ({root}): {path}")
+    return p
+
+
 def to_local(path: str) -> Path:
     return Path(norm_unc(path))
 
@@ -80,9 +125,13 @@ def smb_env() -> dict[str, str]:
     }
 
 
-def run_net(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
+def run_net(args: list[str], timeout: int = 30, capture: bool = True) -> tuple[int, str, str]:
     exe = shutil.which("net") or shutil.which("net.exe") or "net"
     try:
+        if not capture:
+            # 交互模式：不接管 stdio，让 net use 的 "*" 密码提示直接显示给用户
+            p = subprocess.run([exe, *args], timeout=None)
+            return p.returncode, "", ""
         p = subprocess.run(
             [exe, *args],
             capture_output=True,
@@ -98,27 +147,66 @@ def run_net(args: list[str], timeout: int = 30) -> tuple[int, str, str]:
         return 1, "", f"{type(e).__name__}: {e}"
 
 
+def resolve_password() -> str | None:
+    """按优先级解析 SMB 密码，避免明文进入命令行。
+
+    1. 可交互控制台 → 返回 "*"，交给 net use 的交互式密码提示（密码不进命令行）；
+    2. MINAS_PASSWORD_FILE → 从文件读取，读取后提示收紧文件权限；
+    3. MINAS_PASSWORD / MINAS_PASS → 最后兼容，打印安全警告。
+    """
+    # 1) 可交互控制台：优先交互提示
+    if IS_WINDOWS and sys.stdin.isatty() and sys.stdout.isatty():
+        return "*"
+    # 2) 密码文件（非交互场景，如 agent/计划任务）
+    pw_file = os.environ.get("MINAS_PASSWORD_FILE", "").strip()
+    if pw_file:
+        try:
+            pw = Path(pw_file).read_text(encoding="utf-8").strip("\r\n")
+        except OSError as e:
+            print(f"cannot read MINAS_PASSWORD_FILE ({pw_file}): {e}", file=sys.stderr)
+            return None
+        print(
+            f"password loaded from {pw_file}; restrict it to your own user only "
+            f'(e.g. icacls "{pw_file}" /inheritance:r /grant:r %USERNAME%:F)',
+            file=sys.stderr,
+        )
+        return pw
+    # 3) 环境变量（最后兼容，有泄露风险）
+    pw = os.environ.get("MINAS_PASSWORD") or os.environ.get("MINAS_PASS") or ""
+    if pw:
+        print(
+            "security warning: SMB password taken from environment "
+            "(MINAS_PASSWORD/MINAS_PASS); prefer MINAS_PASSWORD_FILE or the "
+            "interactive prompt",
+            file=sys.stderr,
+        )
+        return pw
+    return None
+
+
 def ensure_session(host: str, share: str | None = None) -> None:
     """Best-effort: connect IPC$/share with env credentials if provided."""
     env = smb_env()
     user = env["user"]
-    password = env["password"]
     if not user:
         return  # rely on existing Windows session
+    password = resolve_password()
+    interactive = password == "*"
     target = f"\\\\{host}\\{share}" if share else f"\\\\{host}\\IPC$"
     # disconnect first to avoid 1219 (multiple credentials)
     run_net(["use", target, "/delete", "/y"])
     args = ["use", target, f"/user:{user}"]
     if password:
+        # "*" 时 net 交互式提示，密码不进命令行
         args.append(password)
-    code, out, err = run_net(args)
+    code, out, err = run_net(args, capture=not interactive)
     if code != 0 and share:
         # try IPC$ only
         run_net(["use", f"\\\\{host}\\IPC$", "/delete", "/y"])
         args = ["use", f"\\\\{host}\\IPC$", f"/user:{user}"]
         if password:
             args.append(password)
-        run_net(args)
+        run_net(args, capture=not interactive)
 
 
 def list_shares(host: str) -> list[str]:
@@ -174,7 +262,7 @@ def cmd_shares(_client: Any, args: argparse.Namespace) -> int:
 
 
 def cmd_ls(_client: Any, args: argparse.Namespace) -> int:
-    path = norm_unc(args.path)
+    path = safe_remote(args.path)
     p = to_local(path)
     if not p.exists():
         print(f"not found: {path}", file=sys.stderr)
@@ -240,7 +328,7 @@ def dir_size(path: Path, max_depth: int, depth: int = 0) -> tuple[int, int]:
 
 
 def cmd_du(_client: Any, args: argparse.Namespace) -> int:
-    path = norm_unc(args.path)
+    path = safe_remote(args.path)
     p = to_local(path)
     if not p.exists():
         print(f"not found: {path}", file=sys.stderr)
@@ -288,8 +376,9 @@ def cmd_df(_client: Any, args: argparse.Namespace) -> int:
         else:
             print("pass a UNC path or set MINAS_HOST and MINAS_SHARE", file=sys.stderr)
             return 1
-    p = to_local(norm_unc(path))
-    ensure_session(*parse_unc(norm_unc(path))[:2])
+    path = safe_remote(path)
+    p = to_local(path)
+    ensure_session(*parse_unc(path)[:2])
     try:
         usage = shutil.disk_usage(str(p if p.is_dir() else p.parent))
         info = {
@@ -313,7 +402,7 @@ def cmd_df(_client: Any, args: argparse.Namespace) -> int:
 
 
 def cmd_get(_client: Any, args: argparse.Namespace) -> int:
-    remote = to_local(norm_unc(args.remote))
+    remote = to_local(safe_remote(args.remote))
     local = Path(args.local)
     if not remote.exists():
         print(f"not found: {args.remote}", file=sys.stderr)
@@ -334,7 +423,7 @@ def cmd_put(_client: Any, args: argparse.Namespace) -> int:
     if local.is_dir():
         print("local is a directory; copy files one by one or use robocopy", file=sys.stderr)
         return 1
-    remote = to_local(norm_unc(args.remote))
+    remote = to_local(safe_remote(args.remote))
     remote.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(str(local), str(remote))
     print(f"uploaded {local} -> {remote} ({fmt_size(local.stat().st_size)})")
@@ -342,7 +431,7 @@ def cmd_put(_client: Any, args: argparse.Namespace) -> int:
 
 
 def cmd_cat(_client: Any, args: argparse.Namespace) -> int:
-    remote = to_local(norm_unc(args.path))
+    remote = to_local(safe_remote(args.path))
     if not remote.exists():
         print(f"not found: {args.path}", file=sys.stderr)
         return 2
@@ -351,14 +440,15 @@ def cmd_cat(_client: Any, args: argparse.Namespace) -> int:
 
 
 def cmd_mkdir(_client: Any, args: argparse.Namespace) -> int:
-    remote = to_local(norm_unc(args.path))
+    remote = to_local(safe_remote(args.path))
     remote.mkdir(parents=True, exist_ok=True)
     print(f"mkdir ok: {remote}")
     return 0
 
 
 def cmd_rm(_client: Any, args: argparse.Namespace) -> int:
-    remote = to_local(norm_unc(args.path))
+    # 递归删除严格走 safe_remote：非 UNC 或越过 MINAS_ROOT 一律拒绝
+    remote = to_local(safe_remote(args.path))
     if not remote.exists():
         print(f"not found: {args.path}", file=sys.stderr)
         return 2
@@ -374,8 +464,8 @@ def cmd_rm(_client: Any, args: argparse.Namespace) -> int:
 
 
 def cmd_mv(_client: Any, args: argparse.Namespace) -> int:
-    src = to_local(norm_unc(args.src))
-    dst = to_local(norm_unc(args.dst))
+    src = to_local(safe_remote(args.src))
+    dst = to_local(safe_remote(args.dst))
     if not src.exists():
         print(f"not found: {args.src}", file=sys.stderr)
         return 2
@@ -389,8 +479,8 @@ def cmd_mv(_client: Any, args: argparse.Namespace) -> int:
 
 
 def cmd_cp(_client: Any, args: argparse.Namespace) -> int:
-    src = to_local(norm_unc(args.src))
-    dst = to_local(norm_unc(args.dst))
+    src = to_local(safe_remote(args.src))
+    dst = to_local(safe_remote(args.dst))
     if not src.exists():
         print(f"not found: {args.src}", file=sys.stderr)
         return 2
@@ -410,7 +500,7 @@ def cmd_cp(_client: Any, args: argparse.Namespace) -> int:
 
 
 def cmd_find(_client: Any, args: argparse.Namespace) -> int:
-    root = to_local(norm_unc(args.path))
+    root = to_local(safe_remote(args.path))
     if not root.exists():
         print(f"not found: {args.path}", file=sys.stderr)
         return 2
@@ -453,7 +543,7 @@ def cmd_find(_client: Any, args: argparse.Namespace) -> int:
 
 
 def cmd_tree(_client: Any, args: argparse.Namespace) -> int:
-    root = to_local(norm_unc(args.path))
+    root = to_local(safe_remote(args.path))
 
     def rec(path: Path, prefix: str, depth: int) -> None:
         try:
