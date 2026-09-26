@@ -1,3 +1,8 @@
+---
+name: minas
+description: 小米智能存储（Xiaomi Smart Storage / MINAS）Samba/SMB 文件助手：列共享、列目录、体积统计、上传下载、整理 NAS 文件。当用户提到 小米 NAS / 小米智能存储 / MINAS / 私有云 / Samba / SMB / 共享文件夹 / \\主机\共享名，或需要列出、统计、拷贝、改名、删除 NAS 上的文件时使用。仅做文件层操作，不涉及 SSH/root/Docker/固件。
+---
+
 # minas
 
 > 小米智能存储（Xiaomi Smart Storage / MINAS）Samba 文件助手  
