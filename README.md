@@ -141,10 +141,14 @@ python scripts/minas.py cat //HOST/SHARE/notes.txt
 python scripts/minas.py mkdir //HOST/SHARE/work
 python scripts/minas.py mv //HOST/SHARE/a.txt //HOST/SHARE/work/a.txt
 python scripts/minas.py cp //HOST/SHARE/a.txt //HOST/SHARE/a.bak
+
+# 删除/移动前先预览（只打印计划，不改动任何文件）
+python scripts/minas.py rm //HOST/SHARE/work --recursive --dry-run
 python scripts/minas.py rm //HOST/SHARE/work --recursive
+python scripts/minas.py mv //HOST/SHARE/a.txt //HOST/SHARE/b.txt --dry-run
 ```
 
-`rm --recursive` 删除目录前，请先确认用户同意。
+`rm --recursive` 删除目录前，请先确认用户同意；建议先 `--dry-run` 看一眼再动手。
 
 ### 5.8 `find` — 查找
 
@@ -171,9 +175,9 @@ python scripts/minas.py find //HOST/SHARE --name "*备份*" --json
 | 码 | 含义 |
 |---|---|
 | 0 | 成功 |
-| 1 | 一般错误 / 参数问题 |
-| 2 | 路径不存在 |
-| 3 | 权限或网络问题 |
+| 1 | 一般错误 / 参数问题（含路径不合法、越过 `MINAS_ROOT`） |
+| 2 | 路径不存在（主机与共享可达） |
+| 3 | 权限或网络问题（含主机/共享不可达——此时**不要**当作「文件不存在」） |
 
 ---
 
@@ -225,11 +229,20 @@ minas-skill/
   SKILL.md                 # Agent 技能说明
   README.md                # 本使用文档
   scripts/minas.py         # CLI
+  tests/test_minas.py      # 离线单测（路径安全 / 退出码 / dry-run）
   references/
     samba-surface.md       # 探测结论
     examples.md            # 示例
   docs/USAGE.md            # 与 README 同步的使用说明
+  locales/zh-CN.json       # 技能显示元数据
+  .github/workflows/       # gitleaks 密钥扫描 + 单测 CI
   .gitignore
+```
+
+**运行测试**（纯离线，不触网）：
+
+```powershell
+python -m unittest discover -s tests -v
 ```
 
 ---

@@ -114,6 +114,26 @@ def to_local(path: str) -> Path:
     return Path(norm_unc(path))
 
 
+# Windows winerror 中表示「主机/共享层不可达」的码；与「可达但内部路径不存在」
+# (winerror 2) 区分开，前者走退出码 3（网络/权限），后者才是 2（路径不存在）
+_NETWORK_WINERRORS = {51, 53, 67, 1203, 1231, 1236, 6118}
+
+
+def remote_exists(p: Path, display: str) -> bool:
+    """远端路径存在性检查：True=存在，False=可达但不存在（退出码 2）。
+
+    主机/共享不可达（NAS 掉线、共享未开）时抛 OSError，
+    由 main 映射为退出码 3，避免把网络故障误报成「路径不存在」。
+    """
+    try:
+        p.stat()
+        return True
+    except FileNotFoundError as e:
+        if getattr(e, "winerror", None) in _NETWORK_WINERRORS:
+            raise OSError(f"cannot reach host/share (network/auth?): {display}") from e
+        return False
+
+
 # --------------- SMB session helpers ---------------
 
 def smb_env() -> dict[str, str]:
@@ -184,12 +204,19 @@ def resolve_password() -> str | None:
     return None
 
 
+# 本进程内已成功的会话，避免 mv/cp 这类双路径命令反复 delete+重连
+_sessions: set[str] = set()
+
+
 def ensure_session(host: str, share: str | None = None) -> None:
     """Best-effort: connect IPC$/share with env credentials if provided."""
     env = smb_env()
     user = env["user"]
     if not user:
         return  # rely on existing Windows session
+    key = f"{host.lower()}\\{share or ''}"
+    if key in _sessions:
+        return
     password = resolve_password()
     interactive = password == "*"
     target = f"\\\\{host}\\{share}" if share else f"\\\\{host}\\IPC$"
@@ -200,48 +227,59 @@ def ensure_session(host: str, share: str | None = None) -> None:
         # "*" 时 net 交互式提示，密码不进命令行
         args.append(password)
     code, out, err = run_net(args, capture=not interactive)
-    if code != 0 and share:
+    if code == 0:
+        _sessions.add(key)
+        return
+    if share:
         # try IPC$ only
         run_net(["use", f"\\\\{host}\\IPC$", "/delete", "/y"])
         args = ["use", f"\\\\{host}\\IPC$", f"/user:{user}"]
         if password:
             args.append(password)
-        run_net(args, capture=not interactive)
+        code2, _, _ = run_net(args, capture=not interactive)
+        if code2 == 0:
+            _sessions.add(key)
 
 
-def list_shares(host: str) -> list[str]:
-    """List share names on host via net view (Windows)."""
+def list_shares(host: str) -> tuple[int, list[str]]:
+    """List share names on host via net view (Windows).
+
+    Returns (exit_code, names). A non-zero exit code means the query failed
+    (network/auth/permission) — callers must NOT treat that as "no shares".
+    """
     ensure_session(host, None)
     code, out, err = run_net(["view", f"\\\\{host}"])
     text = out + "\n" + err
     names: list[str] = []
-    # net view output is locale-dependent; grab tokens that look like share rows.
-    # Prefer lines after the dashed separator.
-    lines = text.splitlines()
-    seen_sep = False
-    for line in lines:
-        if re.match(r"^-{3,}", line.strip()):
-            seen_sep = True
-            continue
-        if not seen_sep:
-            continue
-        if not line.strip():
-            continue
-        # columns: Share name  Type  Used as  Comment
-        m = re.match(r"^(\S+(?:\s\S+)*?)\s{2,}(\S+)\s{2,}(.*?)$", line)
-        if m:
-            names.append(m.group(1).strip())
-            continue
-        # fallback: first token
-        toks = line.split()
-        if toks:
-            names.append(toks[0])
-    # unique preserve order
-    out_names = []
-    for n in names:
-        if n and n not in out_names and n.lower() not in {"the", "command", "completed", "successfully", "there"}:
-            out_names.append(n)
-    return out_names
+    if code == 0:
+        # net view output is locale-dependent; grab tokens that look like share rows.
+        # Prefer lines after the dashed separator.
+        lines = text.splitlines()
+        seen_sep = False
+        for line in lines:
+            if re.match(r"^-{3,}", line.strip()):
+                seen_sep = True
+                continue
+            if not seen_sep:
+                continue
+            if not line.strip():
+                continue
+            # columns: Share name  Type  Used as  Comment
+            m = re.match(r"^(\S+(?:\s\S+)*?)\s{2,}(\S+)\s{2,}(.*?)$", line)
+            if m:
+                names.append(m.group(1).strip())
+                continue
+            # fallback: first token
+            toks = line.split()
+            if toks:
+                names.append(toks[0])
+        # unique preserve order
+        out_names = []
+        for n in names:
+            if n and n not in out_names and n.lower() not in {"the", "command", "completed", "successfully", "there"}:
+                out_names.append(n)
+        names = out_names
+    return code, names
 
 
 # --------------- file ops ---------------
@@ -251,7 +289,14 @@ def cmd_shares(_client: Any, args: argparse.Namespace) -> int:
     if not host:
         print("set MINAS_HOST or pass --host", file=sys.stderr)
         return 1
-    names = list_shares(host)
+    code, names = list_shares(host)
+    if code != 0:
+        # 查询失败 ≠ 没有共享：必须以非 0 退出码暴露给 agent
+        if code == 127:
+            print("net command not found (Windows only for shares)", file=sys.stderr)
+            return 1
+        print(f"net view failed for {host} (exit {code}); check network/credentials", file=sys.stderr)
+        return 3
     if args.json:
         print(json.dumps({"host": host, "shares": names}, ensure_ascii=False, indent=2))
     else:
@@ -263,11 +308,11 @@ def cmd_shares(_client: Any, args: argparse.Namespace) -> int:
 
 def cmd_ls(_client: Any, args: argparse.Namespace) -> int:
     path = safe_remote(args.path)
+    ensure_session(*parse_unc(path)[:2])
     p = to_local(path)
-    if not p.exists():
+    if not remote_exists(p, path):
         print(f"not found: {path}", file=sys.stderr)
         return 2
-    ensure_session(*parse_unc(path)[:2])
     if p.is_file():
         items = [{"name": p.name, "path": str(p), "size": p.stat().st_size, "is_dir": False}]
     else:
@@ -276,15 +321,22 @@ def cmd_ls(_client: Any, args: argparse.Namespace) -> int:
             try:
                 st = child.stat()
                 size = st.st_size if child.is_file() else 0
+                modified = (
+                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime))
+                    if child.is_file()
+                    else ""
+                )
             except OSError:
+                # stat 失败：不要复用上一轮的 st，否则会给出错误的 mtime
                 size = 0
+                modified = ""
             items.append(
                 {
                     "name": child.name,
                     "path": str(child),
                     "size": size,
                     "is_dir": child.is_dir(),
-                    "modified": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(st.st_mtime)) if size or child.is_file() else "",
+                    "modified": modified,
                 }
             )
     if args.json:
@@ -329,11 +381,11 @@ def dir_size(path: Path, max_depth: int, depth: int = 0) -> tuple[int, int]:
 
 def cmd_du(_client: Any, args: argparse.Namespace) -> int:
     path = safe_remote(args.path)
+    ensure_session(*parse_unc(path)[:2])
     p = to_local(path)
-    if not p.exists():
+    if not remote_exists(p, path):
         print(f"not found: {path}", file=sys.stderr)
         return 2
-    ensure_session(*parse_unc(path)[:2])
     rows = []
     if p.is_file():
         rows.append((p.name, p.stat().st_size, 1, False))
@@ -377,8 +429,11 @@ def cmd_df(_client: Any, args: argparse.Namespace) -> int:
             print("pass a UNC path or set MINAS_HOST and MINAS_SHARE", file=sys.stderr)
             return 1
     path = safe_remote(path)
-    p = to_local(path)
     ensure_session(*parse_unc(path)[:2])
+    p = to_local(path)
+    if not remote_exists(p, path):
+        print(f"not found: {path}", file=sys.stderr)
+        return 2
     try:
         usage = shutil.disk_usage(str(p if p.is_dir() else p.parent))
         info = {
@@ -402,9 +457,11 @@ def cmd_df(_client: Any, args: argparse.Namespace) -> int:
 
 
 def cmd_get(_client: Any, args: argparse.Namespace) -> int:
-    remote = to_local(safe_remote(args.remote))
+    remote_path = safe_remote(args.remote)
+    ensure_session(*parse_unc(remote_path)[:2])
+    remote = to_local(remote_path)
     local = Path(args.local)
-    if not remote.exists():
+    if not remote_exists(remote, args.remote):
         print(f"not found: {args.remote}", file=sys.stderr)
         return 2
     if local.is_dir():
@@ -423,7 +480,9 @@ def cmd_put(_client: Any, args: argparse.Namespace) -> int:
     if local.is_dir():
         print("local is a directory; copy files one by one or use robocopy", file=sys.stderr)
         return 1
-    remote = to_local(safe_remote(args.remote))
+    remote_path = safe_remote(args.remote)
+    ensure_session(*parse_unc(remote_path)[:2])
+    remote = to_local(remote_path)
     remote.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(str(local), str(remote))
     print(f"uploaded {local} -> {remote} ({fmt_size(local.stat().st_size)})")
@@ -431,8 +490,10 @@ def cmd_put(_client: Any, args: argparse.Namespace) -> int:
 
 
 def cmd_cat(_client: Any, args: argparse.Namespace) -> int:
-    remote = to_local(safe_remote(args.path))
-    if not remote.exists():
+    path = safe_remote(args.path)
+    ensure_session(*parse_unc(path)[:2])
+    remote = to_local(path)
+    if not remote_exists(remote, args.path):
         print(f"not found: {args.path}", file=sys.stderr)
         return 2
     sys.stdout.buffer.write(remote.read_bytes())
@@ -440,7 +501,9 @@ def cmd_cat(_client: Any, args: argparse.Namespace) -> int:
 
 
 def cmd_mkdir(_client: Any, args: argparse.Namespace) -> int:
-    remote = to_local(safe_remote(args.path))
+    path = safe_remote(args.path)
+    ensure_session(*parse_unc(path)[:2])
+    remote = to_local(path)
     remote.mkdir(parents=True, exist_ok=True)
     print(f"mkdir ok: {remote}")
     return 0
@@ -448,50 +511,70 @@ def cmd_mkdir(_client: Any, args: argparse.Namespace) -> int:
 
 def cmd_rm(_client: Any, args: argparse.Namespace) -> int:
     # 递归删除严格走 safe_remote：非 UNC 或越过 MINAS_ROOT 一律拒绝
-    remote = to_local(safe_remote(args.path))
-    if not remote.exists():
+    path = safe_remote(args.path)
+    ensure_session(*parse_unc(path)[:2])
+    remote = to_local(path)
+    if not remote_exists(remote, args.path):
         print(f"not found: {args.path}", file=sys.stderr)
         return 2
     if remote.is_dir():
         if not args.recursive:
             print("refusing to delete directory without --recursive", file=sys.stderr)
             return 1
+        if args.dry_run:
+            print(f"would remove dir: {remote}")
+            return 0
         shutil.rmtree(str(remote))
     else:
+        if args.dry_run:
+            print(f"would remove file: {remote}")
+            return 0
         remote.unlink()
     print(f"removed: {remote}")
     return 0
 
 
 def cmd_mv(_client: Any, args: argparse.Namespace) -> int:
-    src = to_local(safe_remote(args.src))
-    dst = to_local(safe_remote(args.dst))
-    if not src.exists():
+    src_path = safe_remote(args.src)
+    dst_path = safe_remote(args.dst)
+    ensure_session(*parse_unc(src_path)[:2])
+    ensure_session(*parse_unc(dst_path)[:2])
+    src = to_local(src_path)
+    dst = to_local(dst_path)
+    if not remote_exists(src, args.src):
         print(f"not found: {args.src}", file=sys.stderr)
         return 2
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if dst.exists() and not args.force:
+    if remote_exists(dst, args.dst) and not args.force:
         print(f"destination exists (use --force): {dst}", file=sys.stderr)
         return 1
+    if args.dry_run:
+        print(f"would move {src} -> {dst}")
+        return 0
+    dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src), str(dst))
     print(f"moved {src} -> {dst}")
     return 0
 
 
 def cmd_cp(_client: Any, args: argparse.Namespace) -> int:
-    src = to_local(safe_remote(args.src))
-    dst = to_local(safe_remote(args.dst))
-    if not src.exists():
+    src_path = safe_remote(args.src)
+    dst_path = safe_remote(args.dst)
+    ensure_session(*parse_unc(src_path)[:2])
+    ensure_session(*parse_unc(dst_path)[:2])
+    src = to_local(src_path)
+    dst = to_local(dst_path)
+    if not remote_exists(src, args.src):
         print(f"not found: {args.src}", file=sys.stderr)
         return 2
+    dst_exists = remote_exists(dst, args.dst)
     if src.is_dir():
-        if dst.exists() and not args.force:
+        if dst_exists and not args.force:
             print(f"destination exists (use --force): {dst}", file=sys.stderr)
             return 1
         shutil.copytree(str(src), str(dst))
     else:
         dst.parent.mkdir(parents=True, exist_ok=True)
-        if dst.exists() and not args.force:
+        if dst_exists and not args.force:
             print(f"destination exists (use --force): {dst}", file=sys.stderr)
             return 1
         shutil.copy2(str(src), str(dst))
@@ -500,8 +583,10 @@ def cmd_cp(_client: Any, args: argparse.Namespace) -> int:
 
 
 def cmd_find(_client: Any, args: argparse.Namespace) -> int:
-    root = to_local(safe_remote(args.path))
-    if not root.exists():
+    root_path = safe_remote(args.path)
+    ensure_session(*parse_unc(root_path)[:2])
+    root = to_local(root_path)
+    if not remote_exists(root, args.path):
         print(f"not found: {args.path}", file=sys.stderr)
         return 2
     found = []
@@ -543,7 +628,12 @@ def cmd_find(_client: Any, args: argparse.Namespace) -> int:
 
 
 def cmd_tree(_client: Any, args: argparse.Namespace) -> int:
-    root = to_local(safe_remote(args.path))
+    root_path = safe_remote(args.path)
+    ensure_session(*parse_unc(root_path)[:2])
+    root = to_local(root_path)
+    if not remote_exists(root, args.path):
+        print(f"not found: {args.path}", file=sys.stderr)
+        return 2
 
     def rec(path: Path, prefix: str, depth: int) -> None:
         try:
@@ -623,12 +713,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("rm", help="delete file/dir")
     sp.add_argument("path")
     sp.add_argument("-r", "--recursive", action="store_true")
+    sp.add_argument("--dry-run", action="store_true", help="print what would be removed, change nothing")
     sp.set_defaults(func=cmd_rm)
 
     sp = sub.add_parser("mv", help="move/rename")
     sp.add_argument("src")
     sp.add_argument("dst")
     sp.add_argument("-f", "--force", action="store_true")
+    sp.add_argument("--dry-run", action="store_true", help="print the planned move, change nothing")
     sp.set_defaults(func=cmd_mv)
 
     sp = sub.add_parser("cp", help="copy")

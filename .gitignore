@@ -1,9 +1,13 @@
-﻿# secrets / local
+# secrets / local
 .env
 *.pem
 *.key
 minas.local.*
 config.local.json
+# SMB 密码文件（README「密码三选一」推荐方式），绝不入库
+minas_pw*.txt
+*.pw.txt
+minas_password*
 __pycache__/
 *.pyc
 .DS_Store

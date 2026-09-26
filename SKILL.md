@@ -28,10 +28,12 @@ description: 小米智能存储（Xiaomi Smart Storage / MINAS）Samba/SMB 文�
 可选环境变量（**不要把密码写进对话或仓库**）：
 
 ```text
-MINAS_HOST   NAS 的 IP 或主机名
-MINAS_SHARE  默认共享名
-MINAS_USER   SMB 用户名
-MINAS_PASS   SMB 密码
+MINAS_HOST           NAS 的 IP 或主机名
+MINAS_SHARE          默认共享名
+MINAS_USER           SMB 用户名
+MINAS_ROOT           限制所有远端操作只能落在该 UNC 前缀之下（强烈建议设置）
+MINAS_PASSWORD_FILE  密码文件路径（非交互/agent 场景推荐）
+MINAS_PASS           SMB 密码（最后兼容，会打印安全警告，优先用上面两种）
 ```
 
 ## 快速用法
@@ -56,18 +58,19 @@ python scripts/minas.py put ./a.txt //<NAS_IP>/<共享名>/a.txt
 # 整理
 python scripts/minas.py mkdir //<NAS_IP>/<共享名>/work
 python scripts/minas.py mv //.../a.txt //.../work/a.txt
+python scripts/minas.py rm //.../work --recursive --dry-run   # 先预览，不改动
 python scripts/minas.py rm //.../work --recursive
 ```
 
 路径也可用 Windows UNC：`\\NAS\share\file`。
 
-退出码：`0` 成功 · `1` 一般错误 · `2` 不存在 · `3` 权限/网络。
+退出码：`0` 成功 · `1` 一般错误/参数问题 · `2` 路径不存在（主机可达） · `3` 权限、网络或主机/共享不可达。
 
 ## Agent 行为约束（必须遵守）
 
 1. **先探后动**：先 `shares` / `ls` / `du --max-depth`，看清结构再写。  
 2. **大目录禁止无限递归**：`du` / `find` / `tree` 必须带 `--max-depth`。  
-3. **删除必须征得用户同意**：任何 `rm --recursive`、批量删照片/备份目录前先确认。  
+3. **删除必须征得用户同意**：任何 `rm --recursive`、批量删照片/备份目录前先确认；`rm` / `mv` 支持 `--dry-run`，动手前先预览（不改动任何文件）。  
 4. **批量重处理先拉本地**：`get` 到工作目录 → 本地处理 → `put` 回去。  
 5. **不落敏感信息**：账号、密码、完整设备 ID 不写入项目文件、日志、对话。  
 6. **不改系统**：不装服务、不动注册表、不碰 SSH/Docker。
@@ -77,6 +80,7 @@ python scripts/minas.py rm //.../work --recursive
 | 文件 | 作用 |
 |---|---|
 | `scripts/minas.py` | Samba CLI（Windows UNC / `net use`） |
+| `tests/test_minas.py` | 离线单测（路径安全约束 / 退出码 / dry-run） |
 | `references/samba-surface.md` | 协议与共享探测结论 |
 | `references/examples.md` | 常见任务示例 |
 | `docs/USAGE.md` | 完整使用文档 |

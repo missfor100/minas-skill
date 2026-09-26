@@ -51,6 +51,7 @@ python scripts/minas.py mv //HOST/SHARE/IMG_0001.jpg //HOST/SHARE/work/2026_trip
 ```text
 Agent: 目录 //HOST/SHARE/old 有 12GB，确认可以删除吗？
 用户: 确认删除
+Agent: python scripts/minas.py rm //HOST/SHARE/old --recursive --dry-run   # 预览，不改动
 Agent: python scripts/minas.py rm //HOST/SHARE/old --recursive
 ```
 
