@@ -1,5 +1,7 @@
 # 小米智能存储 Samba 文件助手 · 使用文档
 
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+
 面向 **Agent / 脚本** 的小米智能存储（Xiaomi Smart Storage，内部代号 MINAS）文件工具。  
 通过 **Samba（SMB/CIFS）** 列目录、统计空间、上传下载、整理文件，无需挂载盘符。
 
@@ -252,5 +254,16 @@ python -m unittest discover -s tests -v
 - 当前以 **Windows SMB 客户端** 为主路径  
 - Linux/macOS 可改用 `smbclient` / `mount.cifs`（文档未展开）  
 - 共享范围以小米智能存储里实际开启的 Samba 共享为准  
+
+---
+
+## 11. 开源许可
+
+本项目基于 [Apache License 2.0](LICENSE) 开源，版权声明与商标说明见 [NOTICE](NOTICE)。
+
+```text
+Copyright 2026 missfor100
+SPDX-License-Identifier: Apache-2.0
+```
 
 祝整理愉快。

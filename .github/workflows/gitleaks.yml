@@ -1,4 +1,5 @@
-﻿name: gitleaks
+# SPDX-License-Identifier: Apache-2.0
+name: gitleaks
 on:
   push:
   pull_request:
